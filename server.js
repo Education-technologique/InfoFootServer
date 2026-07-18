@@ -1,12 +1,13 @@
 /**
  * InfoFoot Pro - Serveur
  * ------------------------------------------------------------------
- * - GET  /matches         -> proxy football-data.org (scores live + à venir)
+ * - GET  /matches         -> proxy API-Football (api-sports.io) : tous les matchs
+ *                             du jour + matchs en direct, toutes ligues du monde
  * - GET  /news?q=xxx       -> proxy newsapi.org (actualités football)
  * - Socket.io              -> chat public + messages privés (DM)
  *
  * Variables d'environnement à définir sur Render :
- *   FOOTBALL_DATA_KEY  = clé API football-data.org
+ *   API_FOOTBALL_KEY   = clé API api-sports.io (plan gratuit : 100 requêtes/jour)
  *   NEWS_API_KEY       = clé API newsapi.org
  *   CLIENT_ORIGIN      = URL(s) autorisée(s) en CORS, ex: https://tonsite.com
  *                        (plusieurs origines séparées par une virgule, "*" par défaut)
@@ -38,13 +39,10 @@ app.use(express.json());
 const io = new Server(server, { cors: corsOptions });
 
 // ── Config ───────────────────────────────────────────────────────
-const FOOTBALL_DATA_KEY = process.env.FOOTBALL_DATA_KEY || '';
+const API_FOOTBALL_KEY = process.env.API_FOOTBALL_KEY || '';
 const NEWS_API_KEY = process.env.NEWS_API_KEY || '';
-const FOOTBALL_DATA_BASE = 'https://api.football-data.org/v4';
+const API_FOOTBALL_BASE = 'https://v3.football.api-sports.io';
 const NEWS_API_BASE = 'https://newsapi.org/v2';
-
-// Compétitions suivies pour l'onglet "Live"
-const COMPETITIONS = ['CL', 'PL', 'PD', 'FL1', 'BL1'];
 
 // Petit cache mémoire pour éviter de dépasser les quotas gratuits des APIs
 const cache = new Map();
@@ -67,37 +65,66 @@ async function fetchJson(url, headers) {
     return res.json();
 }
 
+// Convertit le statut API-Football (1H, HT, FT, NS...) vers le format attendu par le front
+function mapStatus(shortStatus) {
+    const live = ['1H', '2H', 'ET', 'BT', 'LIVE', 'P'];
+    const paused = ['HT'];
+    const finished = ['FT', 'AET', 'PEN', 'AWD', 'WO'];
+    if (live.includes(shortStatus)) return 'IN_PLAY';
+    if (paused.includes(shortStatus)) return 'PAUSED';
+    if (finished.includes(shortStatus)) return 'FINISHED';
+    return 'SCHEDULED'; // NS, TBD, PST, CANC, SUSP, INT...
+}
+
+// Transforme une "fixture" API-Football en objet attendu par le front (style football-data.org)
+function mapFixture(f) {
+    return {
+        id: f.fixture.id,
+        utcDate: f.fixture.date,
+        status: mapStatus(f.fixture.status?.short),
+        competition: { code: f.league?.id, name: f.league?.name },
+        homeTeam: { shortName: f.teams?.home?.name, name: f.teams?.home?.name, crest: f.teams?.home?.logo },
+        awayTeam: { shortName: f.teams?.away?.name, name: f.teams?.away?.name, crest: f.teams?.away?.logo },
+        score: {
+            fullTime: { home: f.goals?.home, away: f.goals?.away },
+            halfTime: { home: f.score?.halftime?.home, away: f.score?.halftime?.away },
+        },
+    };
+}
+
 // ── Routes ───────────────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 
 app.get('/matches', async (req, res) => {
     try {
-        if (!FOOTBALL_DATA_KEY) return res.json({ matches: [] });
+        if (!API_FOOTBALL_KEY) return res.json({ matches: [] });
 
         const cacheKey = 'matches';
         const cached = getCached(cacheKey, 30_000); // 30s
         if (cached) return res.json(cached);
 
-        const today = new Date();
-        const dateFrom = new Date(today.getTime() - 24 * 3600 * 1000).toISOString().slice(0, 10);
-        const dateTo = new Date(today.getTime() + 24 * 3600 * 1000).toISOString().slice(0, 10);
+        const today = new Date().toISOString().slice(0, 10);
+        const headers = { 'x-apisports-key': API_FOOTBALL_KEY };
 
-        const results = await Promise.all(
-            COMPETITIONS.map(code =>
-                fetchJson(
-                    `${FOOTBALL_DATA_BASE}/competitions/${code}/matches?dateFrom=${dateFrom}&dateTo=${dateTo}`,
-                    { 'X-Auth-Token': FOOTBALL_DATA_KEY }
-                ).catch(err => {
-                    console.error(`[matches] ${code} ->`, err.message);
-                    return { matches: [] };
-                })
-            )
-        );
+        // Tous les matchs du jour, toutes compétitions/pays confondus
+        const dayData = await fetchJson(`${API_FOOTBALL_BASE}/fixtures?date=${today}`, headers);
+        let fixtures = dayData.response || [];
 
-        const matches = results.flatMap(r => r.matches || []);
+        // Complète avec les matchs en direct dans le monde (au cas où fuseaux horaires décalent la date)
+        try {
+            const liveData = await fetchJson(`${API_FOOTBALL_BASE}/fixtures?live=all`, headers);
+            const liveFixtures = liveData.response || [];
+            const knownIds = new Set(fixtures.map(f => f.fixture.id));
+            liveFixtures.forEach(f => { if (!knownIds.has(f.fixture.id)) fixtures.push(f); });
+        } catch (e) {
+            console.error('[matches] live=all ->', e.message);
+        }
+
+        let matches = fixtures.map(mapFixture);
+
         // Live/en cours en premier, puis à venir triées par date
         matches.sort((a, b) => {
-            const rank = s => (s === 'IN_PLAY' || s === 'PAUSED') ? 0 : (s === 'TIMED' || s === 'SCHEDULED') ? 1 : 2;
+            const rank = s => (s === 'IN_PLAY' || s === 'PAUSED') ? 0 : (s === 'SCHEDULED') ? 1 : 2;
             const diff = rank(a.status) - rank(b.status);
             if (diff !== 0) return diff;
             return new Date(a.utcDate) - new Date(b.utcDate);
@@ -180,6 +207,6 @@ io.on('connection', socket => {
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
     console.log(`InfoFoot Pro server listening on port ${PORT}`);
-    if (!FOOTBALL_DATA_KEY) console.warn('⚠️  FOOTBALL_DATA_KEY manquante — /matches renverra une liste vide.');
+    if (!API_FOOTBALL_KEY) console.warn('⚠️  API_FOOTBALL_KEY manquante — /matches renverra une liste vide.');
     if (!NEWS_API_KEY) console.warn('⚠️  NEWS_API_KEY manquante — /news renverra une liste vide.');
 });
